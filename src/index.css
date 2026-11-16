@@ -1,0 +1,61 @@
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --color-cream: #F3EEE3;
+  --color-ink: #111111;
+  --color-orange: #D9541E;
+  --color-orange-soft: rgba(217, 84, 30, 0.10);
+  --color-surface-light: #FFFFFF;
+  --color-surface-light-2: #FBF8F1;
+  --color-surface-dark: #1A1815;
+  --color-surface-dark-2: #221F1B;
+  --color-muted-light: #6B6259;
+  --color-muted-dark: #A69B8C;
+  --font-sans: 'Vazirmatn', system-ui, sans-serif;
+  --radius-card: 16px;
+  --radius-btn: 12px;
+  --shadow-card: 0 1px 2px rgba(17,17,17,0.04), 0 8px 24px rgba(17,17,17,0.05);
+  --shadow-orange-glow: 0 6px 20px rgba(217,84,30,0.35);
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  html {
+    font-family: 'Vazirmatn', system-ui, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    background-color: var(--color-cream);
+    color: var(--color-ink);
+    -webkit-font-smoothing: antialiased;
+    font-variant-numeric: tabular-nums;
+  }
+  .dark body {
+    background-color: #0E0D0B;
+    color: var(--color-cream);
+  }
+  input, .num {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}

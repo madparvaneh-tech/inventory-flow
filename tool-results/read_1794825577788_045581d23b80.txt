@@ -1,0 +1,800 @@
+     1→import { db } from './db';
+     2→import { uid } from './ids';
+     3→import type {
+     4→  Document,
+     5→  DocumentLine,
+     6→  CountLine,
+     7→  FlowOperation,
+     8→  StockStatus,
+     9→  CountMode,
+    10→  AdjustmentDirection,
+    11→} from '../types';
+    12→import {
+    13→  applyInbound,
+    14→  applyOutbound,
+    15→  applyTransferStart,
+    16→  applyTransferComplete,
+    17→  revertDocumentEffects,
+    18→  getWarehouseStock,
+    19→  getVariantAverageCost,
+    20→  peekInventory,
+    21→  assertNoOpenCount,
+    22→} from './inventory';
+    23→
+    24→// شماره سند بعدی = بیشترین شماره موجود + ۱ (مقاوم در برابر حذف اسناد)
+    25→async function nextNumberFor(type: FlowOperation): Promise<string> {
+    26→  const docs = await db.documents.where('type').equals(type).toArray();
+    27→  const max = docs.reduce((m, d) => {
+    28→    const n = parseInt(d.number, 10);
+    29→    return isNaN(n) ? m : Math.max(m, n);
+    30→  }, 0);
+    31→  return String(max + 1);
+    32→}
+    33→
+    34→// نام کالاها برای پیام‌های خطای گویا
+    35→async function variantNameMap(variantIds: string[]) {
+    36→  const unique = [...new Set(variantIds)];
+    37→  const variantRows = await db.variants.bulkGet(unique);
+    38→  const productIdSet = new Set(variantRows.filter(Boolean).map((v) => v!.productId));
+    39→  const productRows = await db.products.bulkGet([...productIdSet]);
+    40→  const nameOf = (variantId: string): string => {
+    41→    const v = variantRows.find((x) => x?.id === variantId);
+    42→    const p = v ? productRows.find((x) => x?.id === v.productId) : undefined;
+    43→    return p?.name ?? v?.name ?? variantId;
+    44→  };
+    45→  return { nameOf };
+    46→}
+    47→
+    48→// میانگین جاری متناسب با وضعیت ردیف — معیوب میانگین مستقل خودش را دارد
+    49→async function statusAwareAvg(
+    50→  variantId: string,
+    51→  warehouseId: string,
+    52→  status: StockStatus
+    53→): Promise<number> {
+    54→  if (status === 'healthy') return getVariantAverageCost(variantId);
+    55→  const row = await peekInventory(variantId, warehouseId, 'defective');
+    56→  const healthyAvg = await getVariantAverageCost(variantId);
+    57→  return row && row.averageCost > 0 ? row.averageCost : healthyAvg;
+    58→}
+    59→
+    60→// ====== ایجاد پیش‌نویس ======
+    61→export async function createDraftDocument(input: {
+    62→  type: FlowOperation;
+    63→  storeId: string;
+    64→  sourceWarehouseId: string | null;
+    65→  destinationWarehouseId: string | null;
+    66→  dateJalali: string;
+    67→  dateEpoch: number;
+    68→  note: string | null;
+    69→  supplier: string | null;
+    70→  referenceNumber: string | null;
+    71→  recipient: string | null;
+    72→  issueType: string | null;
+    73→  shippingCost: number;
+    74→  otherExpenses: number;
+    75→  referenceDocId?: string | null;
+    76→  adjustmentDirection?: AdjustmentDirection | null;
+    77→  adjustmentReason?: string | null;
+    78→  countMode?: CountMode | null;
+    79→  lines: Omit<DocumentLine, 'id' | 'documentId'>[];
+    80→}): Promise<Document> {
+    81→  const number = await nextNumberFor(input.type);
+    82→  const discountTotal = input.lines.reduce((s, l) => s + l.discount, 0);
+    83→  const linesTotal = input.lines.reduce((s, l) => s + l.lineTotal, 0);
+    84→  // مبلغ نهایی سند = جمع اقلام + هزینه حمل + سایر هزینه‌ها
+    85→  const totalAmount = linesTotal + (input.shippingCost || 0) + (input.otherExpenses || 0);
+    86→
+    87→  const doc: Document = {
+    88→    id: uid(),
+    89→    number,
+    90→    type: input.type,
+    91→    status: 'draft',
+    92→    storeId: input.storeId,
+    93→    sourceWarehouseId: input.sourceWarehouseId,
+    94→    destinationWarehouseId: input.destinationWarehouseId,
+    95→    dateJalali: input.dateJalali,
+    96→    dateEpoch: input.dateEpoch,
+    97→    referenceDocId: input.referenceDocId ?? null,
+    98→    note: input.note,
+    99→    supplier: input.supplier,
+   100→    referenceNumber: input.referenceNumber,
+   101→    recipient: input.recipient,
+   102→    issueType: input.issueType,
+   103→    shippingCost: input.shippingCost || 0,
+   104→    otherExpenses: input.otherExpenses || 0,
+   105→    discountTotal,
+   106→    totalAmount,
+   107→    adjustmentDirection: input.adjustmentDirection ?? null,
+   108→    adjustmentReason: input.adjustmentReason ?? null,
+   109→    countMode: input.countMode ?? null,
+   110→    createdAt: Date.now(),
+   111→    confirmedAt: null,
+   112→    reversedAt: null,
+   113→  };
+   114→  await db.documents.add(doc);
+   115→
+   116→  const lines: DocumentLine[] = input.lines.map((l) => ({
+   117→    ...l,
+   118→    id: uid(),
+   119→    documentId: doc.id,
+   120→  }));
+   121→  await db.documentLines.bulkAdd(lines);
+   122→
+   123→  return doc;
+   124→}
+   125→
+   126→// ====== به‌روزرسانی پیش‌نویس ======
+   127→export async function updateDraftDocument(
+   128→  docId: string,
+   129→  input: Partial<Omit<Document, 'id' | 'status' | 'number'>> & {
+   130→    lines?: Omit<DocumentLine, 'id' | 'documentId'>[];
+   131→  }
+   132→): Promise<void> {
+   133→  const doc = await db.documents.get(docId);
+   134→  if (!doc || doc.status !== 'draft') {
+   135→    throw new Error('فقط پیش‌نویس‌ها قابل ویرایش هستند');
+   136→  }
+   137→
+   138→  const { lines, ...rest } = input;
+   139→
+   140→  // حذف تمام ردیف‌های قبلی و درج جدید
+   141→  if (lines) {
+   142→    await db.documentLines.where('documentId').equals(docId).delete();
+   143→    const newLines: DocumentLine[] = lines.map((l) => ({
+   144→      ...l,
+   145→      id: uid(),
+   146→      documentId: docId,
+   147→    }));
+   148→    await db.documentLines.bulkAdd(newLines);
+   149→
+   150→    const discountTotal = newLines.reduce((s, l) => s + l.discount, 0);
+   151→    const linesTotal = newLines.reduce((s, l) => s + l.lineTotal, 0);
+   152→    const shippingCost = rest.shippingCost ?? doc.shippingCost ?? 0;
+   153→    const otherExpenses = rest.otherExpenses ?? doc.otherExpenses ?? 0;
+   154→
+   155→    await db.documents.update(docId, {
+   156→      ...rest,
+   157→      shippingCost,
+   158→      otherExpenses,
+   159→      discountTotal,
+   160→      totalAmount: linesTotal + shippingCost + otherExpenses,
+   161→    });
+   162→  } else {
+   163→    await db.documents.update(docId, rest);
+   164→  }
+   165→}
+   166→
+   167→// توزیع تناسبی هزینه‌های سند رسید (حمل + سایر) بین اقلام بر مبنای ارزش خالص ردیف‌ها
+   168→// خروجی: بهای موثر هر ردیف برای ورود به موجودی
+   169→function allocateExpenses(
+   170→  lines: Omit<DocumentLine, 'id' | 'documentId'>[],
+   171→  shippingCost: number,
+   172→  otherExpenses: number
+   173→): number[] {
+   174→  const totalExtra = (shippingCost || 0) + (otherExpenses || 0);
+   175→  const basis = lines.map((l) => Math.max(0, l.lineTotal));
+   176→  const totalBasis = basis.reduce((s, v) => s + v, 0);
+   177→
+   178→  if (totalExtra <= 0 || totalBasis <= 0) {
+   179→    return lines.map((l) => (l.quantity > 0 ? l.lineTotal / l.quantity : l.unitCost));
+   180→  }
+   181→
+   182→  const result: number[] = [];
+   183→  let allocated = 0;
+   184→  for (let i = 0; i < lines.length; i++) {
+   185→    const l = lines[i];
+   186→    // خط آخر باقیمانده را می‌گیرد تا جمع تخصیص دقیقاً برابر کل هزینه شود
+   187→    const share =
+   188→      i === lines.length - 1
+   189→        ? totalExtra - allocated
+   190→        : totalExtra * (basis[i] / totalBasis);
+   191→    if (i < lines.length - 1) allocated += share;
+   192→    const effective = l.quantity > 0 ? (l.lineTotal + share) / l.quantity : l.unitCost;
+   193→    result.push(effective);
+   194→  }
+   195→  return result;
+   196→}
+   197→
+   198→// ====== مقدار قابل برگشت هر Variant از سند مرجع ======
+   199→// قابل برگشت = مقدار خروج اولیه − مجموع برگشت‌های تأییدشده قبلی
+   200→export interface ReturnableInfo {
+   201→  initial: number;
+   202→  returned: number;
+   203→  remaining: number;
+   204→  refCost: number;
+   205→}
+   206→
+   207→export async function getReturnableByVariant(
+   208→  refDocId: string,
+   209→  excludeReturnDocId?: string
+   210→): Promise<Map<string, ReturnableInfo>> {
+   211→  const map = new Map<string, ReturnableInfo>();
+   212→  const ref = await db.documents.get(refDocId);
+   213→  if (!ref) return map;
+   214→
+   215→  const refLines = await db.documentLines.where('documentId').equals(refDocId).toArray();
+   216→  for (const l of refLines) {
+   217→    const cur = map.get(l.variantId) ?? { initial: 0, returned: 0, remaining: 0, refCost: 0 };
+   218→    cur.initial += l.quantity;
+   219→    if (cur.refCost === 0 && l.unitCost > 0) cur.refCost = l.unitCost;
+   220→    map.set(l.variantId, cur);
+   221→  }
+   222→
+   223→  const returns = await db.documents
+   224→    .where('referenceDocId')
+   225→    .equals(refDocId)
+   226→    .filter((d) => d.type === 'return' && d.status === 'confirmed' && d.id !== excludeReturnDocId)
+   227→    .toArray();
+   228→
+   229→  for (const r of returns) {
+   230→    const rLines = await db.documentLines.where('documentId').equals(r.id).toArray();
+   231→    for (const l of rLines) {
+   232→      const cur = map.get(l.variantId);
+   233→      if (cur) cur.returned += l.quantity;
+   234→    }
+   235→  }
+   236→
+   237→  for (const v of map.values()) v.remaining = Math.max(0, v.initial - v.returned);
+   238→  return map;
+   239→}
+   240→
+   241→// ====== تأیید پیش‌نویس (اعمال اثر موجودی) ======
+   242→export async function confirmDraftDocument(docId: string): Promise<void> {
+   243→  const doc = await db.documents.get(docId);
+   244→  if (!doc || doc.status !== 'draft') {
+   245→    throw new Error('سند برای تأیید معتبر نیست');
+   246→  }
+   247→
+   248→  const lines = await db.documentLines.where('documentId').equals(docId).toArray();
+   249→  if (lines.length === 0 && doc.type !== 'count') throw new Error('سند بدون قلم قابل تأیید نیست');
+   250→
+   251→  // اعمال اثر موجودی
+   252→  if (doc.type === 'receipt') {
+   253→    await assertNoOpenCount([doc.destinationWarehouseId], doc.id);
+   254→    // هزینه حمل و سایر هزینه‌ها به‌صورت تناسبی در بهای تمام‌شده اقلام توزیع می‌شود
+   255→    const effectiveCosts = allocateExpenses(lines, doc.shippingCost, doc.otherExpenses);
+   256→    for (let i = 0; i < lines.length; i++) {
+   257→      await applyInbound(
+   258→        lines[i].variantId,
+   259→        doc.destinationWarehouseId!,
+   260→        lines[i].quantity,
+   261→        effectiveCosts[i],
+   262→        'healthy'
+   263→      );
+   264→      await db.documentLines.update(lines[i].id, { effectiveCost: effectiveCosts[i] });
+   265→    }
+   266→  } else if (doc.type === 'issue') {
+   267→    await assertNoOpenCount([doc.sourceWarehouseId], doc.id);
+   268→    const { nameOf } = await variantNameMap(lines.map((l) => l.variantId));
+   269→    // چک موجودی بر اساس وضعیت هر ردیف (سالم/معیوب)
+   270→    for (const l of lines) {
+   271→      const st = l.stockStatus || 'healthy';
+   272→      const avail = await getWarehouseStock(l.variantId, doc.sourceWarehouseId!, st);
+   273→      if (avail < l.quantity) {
+   274→        throw new Error(
+   275→          `موجودی «${nameOf(l.variantId)}» در انبار کافی نیست (موجودی: ${avail.toLocaleString('en-US')})`
+   276→        );
+   277→      }
+   278→    }
+   279→    for (const l of lines) {
+   280→      const st = l.stockStatus || 'healthy';
+   281→      // بهای موثر خروج = میانگین موزون جاری همان وضعیت
+   282→      const cost = await statusAwareAvg(l.variantId, doc.sourceWarehouseId!, st);
+   283→      await applyOutbound(l.variantId, doc.sourceWarehouseId!, l.quantity, st);
+   284→      await db.documentLines.update(l.id, { effectiveCost: cost });
+   285→    }
+   286→  } else if (doc.type === 'transfer') {
+   287→    await assertNoOpenCount([doc.sourceWarehouseId, doc.destinationWarehouseId], doc.id);
+   288→    for (const l of lines) {
+   289→      await applyTransferStart(l.variantId, doc.sourceWarehouseId!, l.quantity);
+   290→    }
+   291→    // در این نسخه، انتقال بلافاصله تکمیل می‌شود (بدون مرحله در انتظار)
+   292→    for (const l of lines) {
+   293→      await applyTransferComplete(
+   294→        l.variantId,
+   295→        doc.sourceWarehouseId!,
+   296→        doc.destinationWarehouseId!,
+   297→        l.quantity
+   298→      );
+   299→      // انتقال اثر مالی ندارد؛ بهای موثر = میانگین جاری برای گزارش‌ها
+   300→      const avg = await getVariantAverageCost(l.variantId);
+   301→      await db.documentLines.update(l.id, { effectiveCost: avg });
+   302→    }
+   303→  } else if (doc.type === 'return') {
+   304→    // ====== برگشت کالا ======
+   305→    await assertNoOpenCount([doc.destinationWarehouseId], doc.id);
+   306→
+   307→    if (!doc.referenceDocId) throw new Error('برگشت بدون سند مرجع مجاز نیست');
+   308→    const ref = await db.documents.get(doc.referenceDocId);
+   309→    if (!ref || ref.type !== 'issue' || ref.status !== 'confirmed') {
+   310→      throw new Error('سند مرجع معتبر نیست (باید حواله تأییدشده باشد)');
+   311→    }
+   312→    if (ref.storeId !== doc.storeId) {
+   313→      throw new Error('فروشگاه سند برگشت باید با فروشگاه سند مرجع یکسان باشد');
+   314→    }
+   315→
+   316→    // کنترل نهایی سقف برگشت در لحظه تأیید (پیش‌نویس‌های دیگر رزرو نمی‌کنند)
+   317→    const returnable = await getReturnableByVariant(doc.referenceDocId, doc.id);
+   318→    const { nameOf } = await variantNameMap(lines.map((l) => l.variantId));
+   319→    for (const l of lines) {
+   320→      if (l.quantity <= 0) throw new Error('تعداد برگشت هر ردیف باید بزرگتر از صفر باشد');
+   321→      const info = returnable.get(l.variantId);
+   322→      if (!info) throw new Error(`کالای «${nameOf(l.variantId)}» در سند مرجع وجود ندارد`);
+   323→      if (l.quantity > info.remaining) {
+   324→        throw new Error(
+   325→          `مجموع برگشت «${nameOf(l.variantId)}» از مقدار قابل برگشت بیشتر است (باقی‌مانده مجاز: ${info.remaining.toLocaleString('en-US')})`
+   326→        );
+   327→      }
+   328→    }
+   329→
+   330→    // ورود به انبار مقصد در وضعیت سالم یا معیوب (مستقل) با بهای سند مرجع
+   331→    for (const l of lines) {
+   332→      await applyInbound(
+   333→        l.variantId,
+   334→        doc.destinationWarehouseId!,
+   335→        l.quantity,
+   336→        l.unitCost,
+   337→        l.stockStatus || 'healthy'
+   338→      );
+   339→      await db.documentLines.update(l.id, { effectiveCost: l.unitCost });
+   340→    }
+   341→  } else if (doc.type === 'adjustment') {
+   342→    // ====== اصلاح موجودی ======
+   343→    const direction = doc.adjustmentDirection;
+   344→    if (!direction) throw new Error('نوع اصلاح (افزایش/کاهش) مشخص نیست');
+   345→    if (!doc.adjustmentReason) throw new Error('علت اصلاح الزامی است');
+   346→
+   347→    await assertNoOpenCount([doc.sourceWarehouseId], doc.id);
+   348→
+   349→    const { nameOf } = await variantNameMap(lines.map((l) => l.variantId));
+   350→
+   351→    // اعتبارسنجی و محاسبه بهای موثر + موجودی قبل/بعد در لحظه ثبت نهایی
+   352→    interface AdjustPlan {
+   353→      line: DocumentLine;
+   354→      effective: number;
+   355→      before: number;
+   356→      after: number;
+   357→    }
+   358→    const plans: AdjustPlan[] = [];
+   359→
+   360→    for (const l of lines) {
+   361→      const st = l.stockStatus || 'healthy';
+   362→      if (l.quantity <= 0) throw new Error('تعداد اصلاح باید بزرگتر از صفر باشد');
+   363→      const before = await getWarehouseStock(l.variantId, doc.sourceWarehouseId!, st);
+   364→
+   365→      if (direction === 'increase') {
+   366→        if (l.unitCost <= 0) {
+   367→          throw new Error(
+   368→            `بهای واحد برای اصلاح افزایشی کالای «${nameOf(l.variantId)}» الزامی است`
+   369→          );
+   370→        }
+   371→        plans.push({ line: l, effective: l.unitCost, before, after: before + l.quantity });
+   372→      } else {
+   373→        if (l.quantity > before) {
+   374→          throw new Error(
+   375→            `موجودی «${nameOf(l.variantId)}» برای کسر کافی نیست (موجودی فعلی: ${before.toLocaleString('en-US')})`
+   376→          );
+   377→        }
+   378→        const cost = await statusAwareAvg(l.variantId, doc.sourceWarehouseId!, st);
+   379→        plans.push({ line: l, effective: cost, before, after: before - l.quantity });
+   380→      }
+   381→    }
+   382→
+   383→    // اعمال اثر و ثبت ممیزی
+   384→    let total = 0;
+   385→    for (const p of plans) {
+   386→      const st = p.line.stockStatus || 'healthy';
+   387→      if (direction === 'increase') {
+   388→        await applyInbound(
+   389→          p.line.variantId,
+   390→          doc.sourceWarehouseId!,
+   391→          p.line.quantity,
+   392→          p.effective,
+   393→          st
+   394→        );
+   395→      } else {
+   396→        await applyOutbound(
+   397→          p.line.variantId,
+   398→          doc.sourceWarehouseId!,
+   399→          p.line.quantity,
+   400→          st
+   401→        );
+   402→      }
+   403→      const lineTotal = p.line.quantity * p.effective;
+   404→      total += lineTotal;
+   405→      await db.documentLines.update(p.line.id, {
+   406→        effectiveCost: p.effective,
+   407→        balanceBefore: p.before,
+   408→        balanceAfter: p.after,
+   409→        lineTotal,
+   410→      });
+   411→    }
+   412→    await db.documents.update(docId, { totalAmount: total });
+   413→  } else if (doc.type === 'count') {
+   414→    throw new Error('انبارگردانی از مسیر تأیید اختصاصی خود ثبت می‌شود');
+   415→  }
+   416→
+   417→  await db.documents.update(docId, {
+   418→    status: 'confirmed',
+   419→    confirmedAt: Date.now(),
+   420→  });
+   421→}
+   422→
+   423→// ============================================================
+   424→// انبارگردانی — ایجاد و ویرایش پیش‌نویس شمارش
+   425→// ============================================================
+   426→export interface CountLineInput {
+   427→  variantId: string;
+   428→  unitId: string;
+   429→  systemHealthy: number;
+   430→  countedHealthy: number | null;
+   431→  systemDefective: number;
+   432→  countedDefective: number | null;
+   433→  note: string | null;
+   434→}
+   435→
+   436→export async function createCountDraft(input: {
+   437→  storeId: string;
+   438→  warehouseId: string;
+   439→  dateJalali: string;
+   440→  dateEpoch: number;
+   441→  note: string | null;
+   442→  countMode: CountMode;
+   443→  lines: CountLineInput[];
+   444→}): Promise<Document> {
+   445→  // فقط یک انبارگردانی باز برای هر انبار
+   446→  const open = await db.documents
+   447→    .where('type')
+   448→    .equals('count')
+   449→    .filter((d) => d.status === 'draft' && d.sourceWarehouseId === input.warehouseId)
+   450→    .toArray();
+   451→  if (open.length > 0) {
+   452→    throw new Error(
+   453→      `برای این انبار یک انبارگردانی باز وجود دارد (سند #${open[0].number}). ابتدا آن را تأیید یا حذف کنید.`
+   454→    );
+   455→  }
+   456→
+   457→  const number = await nextNumberFor('count');
+   458→  const doc: Document = {
+   459→    id: uid(),
+   460→    number,
+   461→    type: 'count',
+   462→    status: 'draft',
+   463→    storeId: input.storeId,
+   464→    sourceWarehouseId: input.warehouseId,
+   465→    destinationWarehouseId: null,
+   466→    dateJalali: input.dateJalali,
+   467→    dateEpoch: input.dateEpoch,
+   468→    referenceDocId: null,
+   469→    note: input.note,
+   470→    supplier: null,
+   471→    referenceNumber: null,
+   472→    recipient: null,
+   473→    issueType: null,
+   474→    shippingCost: 0,
+   475→    otherExpenses: 0,
+   476→    discountTotal: 0,
+   477→    totalAmount: 0,
+   478→    adjustmentDirection: null,
+   479→    adjustmentReason: null,
+   480→    countMode: input.countMode,
+   481→    createdAt: Date.now(),
+   482→    confirmedAt: null,
+   483→    reversedAt: null,
+   484→  };
+   485→  await db.documents.add(doc);
+   486→
+   487→  const lines: CountLine[] = input.lines.map((l) => ({
+   488→    ...l,
+   489→    id: uid(),
+   490→    documentId: doc.id,
+   491→  }));
+   492→  await db.countLines.bulkAdd(lines);
+   493→  return doc;
+   494→}
+   495→
+   496→export async function updateCountDraft(
+   497→  docId: string,
+   498→  input: {
+   499→    dateJalali: string;
+   500→    dateEpoch: number;
+   501→    note: string | null;
+   502→    lines: CountLineInput[];
+   503→  }
+   504→): Promise<void> {
+   505→  const doc = await db.documents.get(docId);
+   506→  if (!doc || doc.type !== 'count' || doc.status !== 'draft') {
+   507→    throw new Error('فقط پیش‌نویس انبارگردانی قابل ویرایش است');
+   508→  }
+   509→  await db.documents.update(docId, {
+   510→    dateJalali: input.dateJalali,
+   511→    dateEpoch: input.dateEpoch,
+   512→    note: input.note,
+   513→  });
+   514→  await db.countLines.where('documentId').equals(docId).delete();
+   515→  const lines: CountLine[] = input.lines.map((l) => ({
+   516→    ...l,
+   517→    id: uid(),
+   518→    documentId: docId,
+   519→  }));
+   520→  await db.countLines.bulkAdd(lines);
+   521→}
+   522→
+   523→export async function countLinesFor(docId: string): Promise<CountLine[]> {
+   524→  return db.countLines.where('documentId').equals(docId).toArray();
+   525→}
+   526→
+   527→// ============================================================
+   528→// تأیید انبارگردانی — اتمیک: ایجاد اسناد اصلاح + اعمال + تغییر وضعیت
+   529→// ============================================================
+   530→export async function confirmCountDocument(docId: string): Promise<string[]> {
+   531→  const doc = await db.documents.get(docId);
+   532→  if (!doc || doc.type !== 'count') throw new Error('سند انبارگردانی معتبر نیست');
+   533→  if (doc.status !== 'draft') throw new Error('فقط پیش‌نویس انبارگردانی قابل تأیید است');
+   534→
+   535→  const wh = doc.sourceWarehouseId!;
+   536→  const lines = await db.countLines.where('documentId').equals(docId).toArray();
+   537→  const counted = lines.filter((l) => l.countedHealthy !== null || l.countedDefective !== null);
+   538→  if (counted.length === 0) {
+   539→    throw new Error('هیچ ردیفی شمارش نشده است. تعداد شمارش‌شده را وارد کنید.');
+   540→  }
+   541→
+   542→  const { nameOf } = await variantNameMap(lines.map((l) => l.variantId));
+   543→
+   544→  // اعتبارسنجی نسخه موجودی: مبنای شمارش نباید از زمان ایجاد تغییر کرده باشد
+   545→  for (const l of lines) {
+   546→    const sysH = await getWarehouseStock(l.variantId, wh, 'healthy');
+   547→    const sysD = await getWarehouseStock(l.variantId, wh, 'defective');
+   548→    if (sysH !== l.systemHealthy || sysD !== l.systemDefective) {
+   549→      throw new Error(
+   550→        `مبنای شمارش کالای «${nameOf(l.variantId)}» تغییر کرده است. این پیش‌نویس را حذف و انبارگردانی را دوباره ایجاد کنید.`
+   551→      );
+   552→    }
+   553→  }
+   554→
+   555→  // اختلاف‌های مثبت و منفی به‌صورت جداگانه برای وضعیت سالم و معیوب
+   556→  interface Diff {
+   557→    variantId: string;
+   558→    unitId: string;
+   559→    status: StockStatus;
+   560→    qty: number; // مثبت = افزایش، منفی = کاهش
+   561→    before: number;
+   562→    after: number;
+   563→  }
+   564→  const diffs: Diff[] = [];
+   565→  for (const l of lines) {
+   566→    if (l.countedHealthy !== null) {
+   567→      const dh = l.countedHealthy - l.systemHealthy;
+   568→      if (dh !== 0) {
+   569→        diffs.push({
+   570→          variantId: l.variantId,
+   571→          unitId: l.unitId,
+   572→          status: 'healthy',
+   573→          qty: dh,
+   574→          before: l.systemHealthy,
+   575→          after: l.countedHealthy,
+   576→        });
+   577→      }
+   578→    }
+   579→    if (l.countedDefective !== null) {
+   580→      const dd = l.countedDefective - l.systemDefective;
+   581→      if (dd !== 0) {
+   582→        diffs.push({
+   583→          variantId: l.variantId,
+   584→          unitId: l.unitId,
+   585→          status: 'defective',
+   586→          qty: dd,
+   587→          before: l.systemDefective,
+   588→          after: l.countedDefective,
+   589→        });
+   590→      }
+   591→    }
+   592→  }
+   593→
+   594→  const createdIds: string[] = [];
+   595→
+   596→  await db.transaction(
+   597→    'rw',
+   598→    db.documents,
+   599→    db.documentLines,
+   600→    db.countLines,
+   601→    db.inventory,
+   602→    async () => {
+   603→      for (const direction of ['increase', 'decrease'] as const) {
+   604→        const rows = direction === 'increase' ? diffs.filter((d) => d.qty > 0) : diffs.filter((d) => d.qty < 0);
+   605→        if (rows.length === 0) continue;
+   606→
+   607→        const number = await nextNumberFor('adjustment');
+   608→        const nowTs = Date.now();
+   609→        const newLines: DocumentLine[] = [];
+   610→        let total = 0;
+   611→
+   612→        for (const d of rows) {
+   613→          const qty = Math.abs(d.qty);
+   614→          // مبنای ارزش‌گذاری معتبر: میانگین جاری همان وضعیت (با میانگین موزون سازگار است)
+   615→          const cost = await statusAwareAvg(d.variantId, wh, d.status);
+   616→          const lineTotal = qty * cost;
+   617→          total += lineTotal;
+   618→          newLines.push({
+   619→            id: uid(),
+   620→            documentId: '',
+   621→            variantId: d.variantId,
+   622→            quantity: qty,
+   623→            unitId: d.unitId,
+   624→            unitCost: cost,
+   625→            discount: 0,
+   626→            lineTotal,
+   627→            stockStatus: d.status,
+   628→            note: null,
+   629→            effectiveCost: cost,
+   630→            balanceBefore: d.before,
+   631→            balanceAfter: d.after,
+   632→          });
+   633→          if (direction === 'increase') {
+   634→            await applyInbound(d.variantId, wh, qty, cost, d.status);
+   635→          } else {
+   636→            await applyOutbound(d.variantId, wh, qty, d.status);
+   637→          }
+   638→        }
+   639→
+   640→        const adjDoc: Document = {
+   641→          id: uid(),
+   642→          number,
+   643→          type: 'adjustment',
+   644→          status: 'confirmed',
+   645→          storeId: doc.storeId,
+   646→          sourceWarehouseId: wh,
+   647→          destinationWarehouseId: null,
+   648→          dateJalali: doc.dateJalali,
+   649→          dateEpoch: nowTs,
+   650→          referenceDocId: docId,
+   651→          note:
+   652→            direction === 'increase'
+   653→              ? 'اصلاح افزایشی حاصل انبارگردانی'
+   654→              : 'اصلاح کاهشی حاصل انبارگردانی',
+   655→          supplier: null,
+   656→          referenceNumber: null,
+   657→          recipient: null,
+   658→          issueType: null,
+   659→          shippingCost: 0,
+   660→          otherExpenses: 0,
+   661→          discountTotal: 0,
+   662→          totalAmount: total,
+   663→          adjustmentDirection: direction,
+   664→          adjustmentReason: 'اصلاح کسری شمارش',
+   665→          countMode: null,
+   666→          createdAt: nowTs,
+   667→          confirmedAt: nowTs,
+   668→          reversedAt: null,
+   669→        };
+   670→        await db.documents.add(adjDoc);
+   671→        await db.documentLines.bulkAdd(newLines.map((l) => ({ ...l, documentId: adjDoc.id })));
+   672→        createdIds.push(adjDoc.id);
+   673→      }
+   674→
+   675→      await db.documents.update(docId, { status: 'confirmed', confirmedAt: Date.now() });
+   676→    }
+   677→  );
+   678→
+   679→  return createdIds;
+   680→}
+   681→
+   682→// ============================================================
+   683→// برگشت انبارگردانی — ابطال سند + ابطال اسناد اصلاح متصل
+   684→// ============================================================
+   685→export async function reverseCountDocument(docId: string): Promise<void> {
+   686→  const doc = await db.documents.get(docId);
+   687→  if (!doc || doc.type !== 'count') throw new Error('سند انبارگردانی معتبر نیست');
+   688→  if (doc.status !== 'confirmed') throw new Error('فقط اسناد تأییدشده قابل برگشت هستند');
+   689→
+   690→  const deps = await db.documents.where('referenceDocId').equals(docId).toArray();
+   691→  const active = deps.filter((d) => d.status === 'confirmed');
+   692→
+   693→  for (const adj of active) {
+   694→    await revertDocumentEffects(adj.id);
+   695→    await db.documents.update(adj.id, { status: 'reversed', reversedAt: Date.now() });
+   696→  }
+   697→
+   698→  await db.documents.update(docId, { status: 'reversed', reversedAt: Date.now() });
+   699→}
+   700→
+   701→// ====== برگشت از تأیید ======
+   702→export async function reverseDocument(docId: string): Promise<void> {
+   703→  const doc = await db.documents.get(docId);
+   704→  if (!doc || doc.status !== 'confirmed') {
+   705→    throw new Error('فقط اسناد تأییدشده قابل برگشت هستند');
+   706→  }
+   707→
+   708→  if (doc.type === 'count') {
+   709→    throw new Error('برای برگشت انبارگردانی از مسیر اختصاصی سند انبارگردانی استفاده کنید');
+   710→  }
+   711→
+   712→  if (doc.type === 'adjustment' && doc.referenceDocId) {
+   713→    const ref = await db.documents.get(doc.referenceDocId);
+   714→    if (ref && ref.type === 'count') {
+   715→      throw new Error(
+   716→        'این سند اصلاح به انبارگردانی متصل است و فقط از طریق برگشت سند انبارگردانی قابل ابطال است'
+   717→      );
+   718→    }
+   719→  }
+   720→
+   721→  // چک وابستگی: آیا سند دیگری به این سند ارجاع دارد؟
+   722→  const dependents = await db.documents.where('referenceDocId').equals(docId).toArray();
+   723→  const confirmedDeps = dependents.filter((d) => d.status !== 'reversed');
+   724→  if (confirmedDeps.length > 0) {
+   725→    throw new Error('این سند توسط سند دیگری استفاده شده و قابل برگشت نیست');
+   726→  }
+   727→
+   728→  // خنثی‌سازی اثر موجودی
+   729→  await revertDocumentEffects(docId);
+   730→
+   731→  await db.documents.update(docId, {
+   732→    status: 'reversed',
+   733→    reversedAt: Date.now(),
+   734→  });
+   735→}
+   736→
+   737→// ====== حذف سند ======
+   738→export async function deleteDocument(docId: string): Promise<void> {
+   739→  const doc = await db.documents.get(docId);
+   740→  if (!doc) throw new Error('سند یافت نشد');
+   741→
+   742→  if (doc.type === 'adjustment' && doc.referenceDocId) {
+   743→    const ref = await db.documents.get(doc.referenceDocId);
+   744→    if (ref && ref.type === 'count') {
+   745→      throw new Error(
+   746→        'این سند اصلاح به انبارگردانی متصل است و فقط از طریق برگشت سند انبارگردانی قابل حذف است'
+   747→      );
+   748→    }
+   749→  }
+   750→
+   751→  if (doc.type === 'count' && doc.status === 'confirmed') {
+   752→    throw new Error('برای حذف، ابتدا سند انبارگردانی را برگشت از تأیید کنید');
+   753→  }
+   754→
+   755→  if (doc.status === 'confirmed') {
+   756→    // چک وابستگی
+   757→    const dependents = await db.documents.where('referenceDocId').equals(docId).toArray();
+   758→    const confirmedDeps = dependents.filter((d) => d.status !== 'reversed');
+   759→    if (confirmedDeps.length > 0) {
+   760→      throw new Error('این سند توسط سند دیگری استفاده شده و قابل حذف نیست');
+   761→    }
+   762→    // خنثی‌سازی اثر موجودی
+   763→    await revertDocumentEffects(docId);
+   764→  }
+   765→
+   766→  // حذف ردیف‌ها و خود سند
+   767→  await db.documentLines.where('documentId').equals(docId).delete();
+   768→  await db.countLines.where('documentId').equals(docId).delete();
+   769→  await db.documents.delete(docId);
+   770→}
+   771→
+   772→// ====== خواندن سند + ردیف‌ها ======
+   773→export async function getDocumentWithLines(docId: string) {
+   774→  const doc = await db.documents.get(docId);
+   775→  if (!doc) return null;
+   776→  const lines = await db.documentLines.where('documentId').equals(docId).toArray();
+   777→  return { doc, lines };
+   778→}
+   779→
+   780→// ====== علت‌های اصلاح موجودی ======
+   781→export async function saveAdjustmentReason(input: { id?: string; name: string }): Promise<string> {
+   782→  const name = input.name.trim();
+   783→  if (!name) throw new Error('متن علت الزامی است');
+   784→  const all = await db.adjustmentReasons.toArray();
+   785→  if (all.some((r) => r.name === name && r.id !== input.id)) {
+   786→    throw new Error('این علت قبلاً ثبت شده است');
+   787→  }
+   788→  if (input.id) {
+   789→    await db.adjustmentReasons.update(input.id, { name });
+   790→    return input.id;
+   791→  }
+   792→  const id = uid();
+   793→  await db.adjustmentReasons.add({ id, name });
+   794→  return id;
+   795→}
+   796→
+   797→export async function deleteAdjustmentReason(id: string): Promise<void> {
+   798→  await db.adjustmentReasons.delete(id);
+   799→}
+   800→

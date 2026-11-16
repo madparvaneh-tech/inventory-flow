@@ -1,29 +1,46 @@
-import { type ReactNode } from 'react';
+import * as React from "react"
+import { Slot } from "@radix-ui/react-slot"
+import { cva, type VariantProps } from "class-variance-authority"
 
-interface BadgeProps {
-  variant?: 'orange' | 'ink' | 'success' | 'danger' | 'muted';
-  size?: 'sm' | 'md';
-  children: ReactNode;
-  className?: string;
-}
+import { cn } from "@/lib/utils"
 
-export function Badge({ variant = 'orange', size = 'md', children, className = '' }: BadgeProps) {
-  const variants = {
-    orange: 'bg-orange-soft text-orange',
-    ink: 'bg-black/5 dark:bg-cream/10 text-ink dark:text-cream',
-    success: 'bg-green-500/10 text-green-700 dark:text-green-400',
-    danger: 'bg-red-500/10 text-red-600 dark:text-red-400',
-    muted: 'bg-black/5 dark:bg-cream/10 text-muted-light dark:text-muted-dark',
-  };
-  
-  const sizes = {
-    sm: 'px-2 py-0.5 text-[9.5px]',
-    md: 'px-2.5 py-1 text-[10px]',
-  };
-  
+const badgeVariants = cva(
+  "inline-flex items-center justify-center rounded-md border px-2 py-0.5 text-xs font-medium w-fit whitespace-nowrap shrink-0 [&>svg]:size-3 gap-1 [&>svg]:pointer-events-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive transition-[color,box-shadow] overflow-hidden",
+  {
+    variants: {
+      variant: {
+        default:
+          "border-transparent bg-primary text-primary-foreground [a&]:hover:bg-primary/90",
+        secondary:
+          "border-transparent bg-secondary text-secondary-foreground [a&]:hover:bg-secondary/90",
+        destructive:
+          "border-transparent bg-destructive text-white [a&]:hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40 dark:bg-destructive/60",
+        outline:
+          "text-foreground [a&]:hover:bg-accent [a&]:hover:text-accent-foreground",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+)
+
+function Badge({
+  className,
+  variant,
+  asChild = false,
+  ...props
+}: React.ComponentProps<"span"> &
+  VariantProps<typeof badgeVariants> & { asChild?: boolean }) {
+  const Comp = asChild ? Slot : "span"
+
   return (
-    <span className={`inline-flex items-center gap-1 font-bold rounded-md ${variants[variant]} ${sizes[size]} ${className}`}>
-      {children}
-    </span>
-  );
+    <Comp
+      data-slot="badge"
+      className={cn(badgeVariants({ variant }), className)}
+      {...props}
+    />
+  )
 }
+
+export { Badge, badgeVariants }

@@ -1,0 +1,847 @@
+     1→import { db } from './db';
+     2→import type {
+     3→  Category,
+     4→  Document,
+     5→  DocumentLine,
+     6→  FlowOperation,
+     7→  Inventory,
+     8→  Product,
+     9→  StockStatus,
+    10→  Store,
+    11→  Unit,
+    12→  Variant,
+    13→  Warehouse,
+    14→} from '../types';
+    15→
+    16→// ============================================================
+    17→// موتور گزارش‌های مدیریتی
+    18→// - فقط از اسناد تأییدشده و داده واقعی موجودی استفاده می‌کند
+    19→// - با موتور میانگین موزون برنامه هماهنگ است
+    20→// - انتقال داخلی در سطح شرکت/فروشگاه گردش واقعی نیست ولی
+    21→//   در سطح انبار به‌صورت خروج از مبدأ و ورود به مقصد دیده می‌شود
+    22→// ============================================================
+    23→
+    24→export interface ReportDataset {
+    25→  docs: Document[];
+    26→  linesByDoc: Map<string, DocumentLine[]>;
+    27→  products: Product[];
+    28→  variants: Variant[];
+    29→  categories: Category[];
+    30→  stores: Store[];
+    31→  warehouses: Warehouse[];
+    32→  units: Unit[];
+    33→  inventory: Inventory[];
+    34→  // نگاشت‌های کمکی
+    35→  variantById: Map<string, Variant>;
+    36→  productById: Map<string, Product>;
+    37→  categoryById: Map<string, Category>;
+    38→  storeById: Map<string, Store>;
+    39→  warehouseById: Map<string, Warehouse>;
+    40→  unitById: Map<string, Unit>;
+    41→}
+    42→
+    43→export async function buildReportDataset(): Promise<ReportDataset> {
+    44→  const [docs, lines, products, variants, categories, stores, warehouses, units, inventory] =
+    45→    await Promise.all([
+    46→      db.documents.toArray(),
+    47→      db.documentLines.toArray(),
+    48→      db.products.toArray(),
+    49→      db.variants.toArray(),
+    50→      db.categories.toArray(),
+    51→      db.stores.toArray(),
+    52→      db.warehouses.toArray(),
+    53→      db.units.toArray(),
+    54→      db.inventory.toArray(),
+    55→    ]);
+    56→
+    57→  const linesByDoc = new Map<string, DocumentLine[]>();
+    58→  for (const l of lines) {
+    59→    const arr = linesByDoc.get(l.documentId);
+    60→    if (arr) arr.push(l);
+    61→    else linesByDoc.set(l.documentId, [l]);
+    62→  }
+    63→
+    64→  return {
+    65→    docs,
+    66→    linesByDoc,
+    67→    products,
+    68→    variants,
+    69→    categories,
+    70→    stores,
+    71→    warehouses,
+    72→    units,
+    73→    inventory,
+    74→    variantById: new Map(variants.map((v) => [v.id, v])),
+    75→    productById: new Map(products.map((p) => [p.id, p])),
+    76→    categoryById: new Map(categories.map((c) => [c.id, c])),
+    77→    storeById: new Map(stores.map((s) => [s.id, s])),
+    78→    warehouseById: new Map(warehouses.map((w) => [w.id, w])),
+    79→    unitById: new Map(units.map((u) => [u.id, u])),
+    80→  };
+    81→}
+    82→
+    83→// بهای موثر خط — با effectiveCost ثبت‌شده در تأیید و fallback مناسب
+    84→export function lineEffectiveCost(l: DocumentLine): number {
+    85→  if (l.effectiveCost !== null && l.effectiveCost !== undefined) return l.effectiveCost;
+    86→  return l.unitCost || 0;
+    87→}
+    88→
+    89→// ============================================================
+    90→// ۱) گزارش وضعیت موجودی
+    91→// ============================================================
+    92→export interface StockStatusRow {
+    93→  variantId: string;
+    94→  productName: string;
+    95→  productSku: string;
+    96→  variantSku: string;
+    97→  categoryName: string;
+    98→  storeId: string;
+    99→  storeName: string;
+   100→  warehouseId: string;
+   101→  warehouseName: string;
+   102→  healthy: number;
+   103→  defective: number;
+   104→  inTransit: number;
+   105→  minStock: number;
+   106→  reorderPoint: number;
+   107→  unitName: string;
+   108→  productActive: boolean;
+   109→}
+   110→
+   111→export interface StockStatusFilters {
+   112→  productId: string; // 'all'
+   113→  variantId: string;
+   114→  categoryId: string;
+   115→  storeId: string;
+   116→  warehouseId: string;
+   117→  activeFilter: 'all' | 'active' | 'inactive';
+   118→  stockFilter: 'all' | 'with-stock' | 'without-stock';
+   119→}
+   120→
+   121→export function stockStatusReport(ds: ReportDataset, f: StockStatusFilters): StockStatusRow[] {
+   122→  const rows = new Map<string, StockStatusRow>();
+   123→
+   124→  const ensureRow = (variantId: string, warehouseId: string): StockStatusRow | null => {
+   125→    const key = `${variantId}|${warehouseId}`;
+   126→    if (rows.has(key)) return rows.get(key)!;
+   127→    const v = ds.variantById.get(variantId);
+   128→    const p = v ? ds.productById.get(v.productId) : undefined;
+   129→    const w = ds.warehouseById.get(warehouseId);
+   130→    if (!v || !p || !w) return null;
+   131→    const store = ds.storeById.get(w.storeId);
+   132→    const category = ds.categoryById.get(p.categoryId);
+   133→    const unit = ds.unitById.get(p.mainUnitId);
+   134→    const row: StockStatusRow = {
+   135→      variantId,
+   136→      productName: p.name,
+   137→      productSku: p.sku,
+   138→      variantSku: v.sku,
+   139→      categoryName: category?.name ?? '—',
+   140→      storeId: w.storeId,
+   141→      storeName: store?.name ?? '—',
+   142→      warehouseId,
+   143→      warehouseName: w.name,
+   144→      healthy: 0,
+   145→      defective: 0,
+   146→      inTransit: 0,
+   147→      minStock: p.minStock,
+   148→      reorderPoint: p.reorderPoint,
+   149→      unitName: unit?.name ?? '',
+   150→      productActive: p.isActive,
+   151→    };
+   152→    rows.set(key, row);
+   153→    return row;
+   154→  };
+   155→
+   156→  for (const inv of ds.inventory) {
+   157→    const row = ensureRow(inv.variantId, inv.warehouseId);
+   158→    if (!row) continue;
+   159→    if (inv.status === 'healthy') row.healthy += inv.quantity;
+   160→    else if (inv.status === 'defective') row.defective += inv.quantity;
+   161→    else if (inv.status === 'in-transit') row.inTransit += inv.quantity;
+   162→  }
+   163→
+   164→  // ردیف‌های بدون هیچ موجودی برای کالاهای فعال هم دیده شوند (در سطح انبارهای ثبت‌شده)
+   165→  if (f.stockFilter === 'all' || f.stockFilter === 'without-stock') {
+   166→    for (const w of ds.warehouses) {
+   167→      for (const v of ds.variants) {
+   168→        const p = ds.productById.get(v.productId);
+   169→        if (!p) continue;
+   170→        const key = `${v.id}|${w.id}`;
+   171→        if (!rows.has(key)) {
+   172→          ensureRow(v.id, w.id);
+   173→        }
+   174→      }
+   175→    }
+   176→  }
+   177→
+   178→  let result = [...rows.values()];
+   179→
+   180→  result = result.filter((r) => {
+   181→    if (f.productId !== 'all') {
+   182→      const v = ds.variantById.get(r.variantId);
+   183→      if (!v || v.productId !== f.productId) return false;
+   184→    }
+   185→    if (f.variantId !== 'all' && r.variantId !== f.variantId) return false;
+   186→    if (f.categoryId !== 'all') {
+   187→      const v = ds.variantById.get(r.variantId);
+   188→      const p = v ? ds.productById.get(v.productId) : undefined;
+   189→      if (!p || p.categoryId !== f.categoryId) return false;
+   190→    }
+   191→    if (f.storeId !== 'all' && r.storeId !== f.storeId) return false;
+   192→    if (f.warehouseId !== 'all' && r.warehouseId !== f.warehouseId) return false;
+   193→    if (f.activeFilter === 'active' && !r.productActive) return false;
+   194→    if (f.activeFilter === 'inactive' && r.productActive) return false;
+   195→    const total = r.healthy + r.defective + r.inTransit;
+   196→    if (f.stockFilter === 'with-stock' && total <= 0) return false;
+   197→    if (f.stockFilter === 'without-stock' && total > 0) return false;
+   198→    return true;
+   199→  });
+   200→
+   201→  result.sort(
+   202→    (a, b) =>
+   203→      a.productName.localeCompare(b.productName, 'fa') ||
+   204→      a.warehouseName.localeCompare(b.warehouseName, 'fa')
+   205→  );
+   206→  return result;
+   207→}
+   208→
+   209→// ============================================================
+   210→// ۲) گزارش کمبود و نقطه سفارش
+   211→// ============================================================
+   212→export type ShortageStatus = 'zero' | 'below-min' | 'at-reorder' | 'defective-only' | 'ok';
+   213→
+   214→export interface ShortageRow {
+   215→  variantId: string;
+   216→  productName: string;
+   217→  variantSku: string;
+   218→  categoryId: string;
+   219→  categoryName: string;
+   220→  storeId: string;
+   221→  storeName: string;
+   222→  warehouseId: string;
+   223→  warehouseName: string;
+   224→  healthy: number;
+   225→  defective: number;
+   226→  minStock: number;
+   227→  reorderPoint: number;
+   228→  unitName: string;
+   229→  status: ShortageStatus;
+   230→  shortfall: number;
+   231→  suggestedOrder: number;
+   232→  storeHasCoverage: boolean; // فروشگاه کلش کافی است ولی این انبار کمبود دارد
+   233→}
+   234→
+   235→export interface ShortageFilters {
+   236→  storeId: string;
+   237→  warehouseId: string;
+   238→  categoryId: string;
+   239→  productId: string;
+   240→  minStockOnly: boolean; // فقط کمبودها
+   241→  marginPercent: number; // حاشیه اطمینان
+   242→}
+   243→
+   244→export function shortageReport(ds: ReportDataset, f: ShortageFilters): ShortageRow[] {
+   245→  const stockRows = stockStatusReport(ds, {
+   246→    productId: f.productId,
+   247→    variantId: 'all',
+   248→    categoryId: f.categoryId,
+   249→    storeId: f.storeId,
+   250→    warehouseId: f.warehouseId,
+   251→    activeFilter: 'all',
+   252→    stockFilter: 'all',
+   253→  });
+   254→
+   255→  // موجودی کل فروشگاه برای هر واریانت (برای هشدار پوشش فروشگاه)
+   256→  const storeTotals = new Map<string, number>();
+   257→  for (const r of stockRows) {
+   258→    storeTotals.set(`${r.variantId}|${r.storeId}`, (storeTotals.get(`${r.variantId}|${r.storeId}`) ?? 0) + r.healthy);
+   259→  }
+   260→
+   261→  const rows: ShortageRow[] = stockRows.map((r) => {
+   262→    let status: ShortageStatus;
+   263→    if (r.healthy === 0) status = 'zero';
+   264→    else if (r.healthy < r.minStock) status = 'below-min';
+   265→    else if (r.healthy <= r.reorderPoint && r.reorderPoint > 0) status = 'at-reorder';
+   266→    else if (r.defective > 0) status = 'defective-only';
+   267→    else status = 'ok';
+   268→
+   269→    const target = r.minStock * (1 + f.marginPercent / 100);
+   270→    const storeTotal = storeTotals.get(`${r.variantId}|${r.storeId}`) ?? 0;
+   271→
+   272→    return {
+   273→      variantId: r.variantId,
+   274→      productName: r.productName,
+   275→      variantSku: r.variantSku,
+   276→      categoryId: '',
+   277→      categoryName: r.categoryName,
+   278→      storeId: r.storeId,
+   279→      storeName: r.storeName,
+   280→      warehouseId: r.warehouseId,
+   281→      warehouseName: r.warehouseName,
+   282→      healthy: r.healthy,
+   283→      defective: r.defective,
+   284→      minStock: r.minStock,
+   285→      reorderPoint: r.reorderPoint,
+   286→      unitName: r.unitName,
+   287→      status,
+   288→      shortfall: Math.max(0, r.minStock - r.healthy),
+   289→      suggestedOrder: Math.max(0, Math.ceil(target - r.healthy)),
+   290→      storeHasCoverage: storeTotal >= r.minStock && r.healthy < r.minStock,
+   291→    };
+   292→  });
+   293→
+   294→  const filtered = f.minStockOnly ? rows.filter((r) => r.status === 'zero' || r.status === 'below-min' || r.status === 'at-reorder') : rows;
+   295→  filtered.sort(
+   296→    (a, b) =>
+   297→      b.shortfall - a.shortfall ||
+   298→      a.productName.localeCompare(b.productName, 'fa') ||
+   299→      a.warehouseName.localeCompare(b.warehouseName, 'fa')
+   300→  );
+   301→  return filtered;
+   302→}
+   303→
+   304→// ============================================================
+   305→// ۳) گزارش کالاهای بدون گردش و کم‌گردش
+   306→// ============================================================
+   307→export type DeadStockClass = 'no-movement' | 'low-movement' | 'normal';
+   308→
+   309→export interface DeadStockRow {
+   310→  variantId: string;
+   311→  productName: string;
+   312→  variantSku: string;
+   313→  categoryName: string;
+   314→  unitName: string;
+   315→  totalHealthy: number;
+   316→  productActive: boolean;
+   317→  inboundOps: number;
+   318→  inboundQty: number;
+   319→  outboundOps: number;
+   320→  outboundQty: number;
+   321→  lastInDate: number | null;
+   322→  lastOutDate: number | null;
+   323→  lastMovementDate: number | null;
+   324→  daysSinceMovement: number | null;
+   325→  hasInNoOut: boolean;
+   326→  classification: DeadStockClass;
+   327→}
+   328→
+   329→export interface DeadStockFilters {
+   330→  fromEpoch: number;
+   331→  toEpoch: number;
+   332→  categoryId: string;
+   333→  productId: string;
+   334→  exitThreshold: number; // آستانه کم‌گردشی (دفعات خروج)
+   335→  onlyWithStock: boolean;
+   336→  includeInactive: boolean;
+   337→}
+   338→
+   339→export function deadStockReport(ds: ReportDataset, f: DeadStockFilters): DeadStockRow[] {
+   340→  // گردش واقعی شرکت: رسید/حواله/برگشت/اصلاح — انتقال داخلی محسوب نمی‌شود
+   341→  const confirmed = ds.docs.filter((d) => d.status === 'confirmed');
+   342→
+   343→  const agg = new Map<
+   344→    string,
+   345→    {
+   346→      inboundOps: number;
+   347→      inboundQty: number;
+   348→      outboundOps: number;
+   349→      outboundQty: number;
+   350→      lastIn: number | null;
+   351→      lastOut: number | null;
+   352→    }
+   353→  >();
+   354→
+   355→  const bump = (variantId: string, dir: 'in' | 'out', qty: number, epoch: number) => {
+   356→    let a = agg.get(variantId);
+   357→    if (!a) {
+   358→      a = { inboundOps: 0, inboundQty: 0, outboundOps: 0, outboundQty: 0, lastIn: null, lastOut: null };
+   359→      agg.set(variantId, a);
+   360→    }
+   361→    if (dir === 'in') {
+   362→      a.inboundOps += 1;
+   363→      a.inboundQty += qty;
+   364→      if (a.lastIn === null || epoch > a.lastIn) a.lastIn = epoch;
+   365→    } else {
+   366→      a.outboundOps += 1;
+   367→      a.outboundQty += qty;
+   368→      if (a.lastOut === null || epoch > a.lastOut) a.lastOut = epoch;
+   369→    }
+   370→  };
+   371→
+   372→  for (const d of confirmed) {
+   373→    if (d.type === 'transfer') continue; // انتقال داخلی گردش واقعی شرکت نیست
+   374→    const lines = ds.linesByDoc.get(d.id) ?? [];
+   375→    for (const l of lines) {
+   376→      const qty = l.quantity;
+   377→      if (d.type === 'receipt') bump(l.variantId, 'in', qty, d.dateEpoch);
+   378→      else if (d.type === 'return') bump(l.variantId, 'in', qty, d.dateEpoch);
+   379→      else if (d.type === 'adjustment') {
+   380→        if (d.adjustmentDirection === 'increase') bump(l.variantId, 'in', qty, d.dateEpoch);
+   381→        else bump(l.variantId, 'out', qty, d.dateEpoch);
+   382→      } else if (d.type === 'issue') bump(l.variantId, 'out', qty, d.dateEpoch);
+   383→    }
+   384→  }
+   385→
+   386→  const now = Date.now();
+   387→  const rows: DeadStockRow[] = [];
+   388→
+   389→  for (const v of ds.variants) {
+   390→    const p = ds.productById.get(v.productId);
+   391→    if (!p) continue;
+   392→    if (!f.includeInactive && !p.isActive) continue;
+   393→    if (f.productId !== 'all' && v.productId !== f.productId) continue;
+   394→    if (f.categoryId !== 'all' && p.categoryId !== f.categoryId) continue;
+   395→
+   396→    const a = agg.get(v.id) ?? {
+   397→      inboundOps: 0,
+   398→      inboundQty: 0,
+   399→      outboundOps: 0,
+   400→      outboundQty: 0,
+   401→      lastIn: null,
+   402→      lastOut: null,
+   403→    };
+   404→
+   405→    const totalHealthy = ds.inventory
+   406→      .filter((i) => i.variantId === v.id && i.status === 'healthy')
+   407→      .reduce((s, i) => s + i.quantity, 0);
+   408→
+   409→    if (f.onlyWithStock && totalHealthy <= 0) continue;
+   410→
+   411→    const lastMovement =
+   412→      a.lastIn !== null || a.lastOut !== null ? Math.max(a.lastIn ?? 0, a.lastOut ?? 0) : null;
+   413→    const daysSince =
+   414→      lastMovement !== null ? Math.floor((now - lastMovement) / 86400000) : null;
+   415→
+   416→    let classification: DeadStockClass = 'normal';
+   417→    if (a.outboundOps === 0 && a.inboundOps === 0) classification = 'no-movement';
+   418→    else if (a.outboundOps < f.exitThreshold) classification = 'low-movement';
+   419→
+   420→    const unit = ds.unitById.get(p.mainUnitId);
+   421→    rows.push({
+   422→      variantId: v.id,
+   423→      productName: p.name,
+   424→      variantSku: v.sku,
+   425→      categoryName: ds.categoryById.get(p.categoryId)?.name ?? '—',
+   426→      unitName: unit?.name ?? '',
+   427→      totalHealthy,
+   428→      productActive: p.isActive,
+   429→      inboundOps: a.inboundOps,
+   430→      inboundQty: a.inboundQty,
+   431→      outboundOps: a.outboundOps,
+   432→      outboundQty: a.outboundQty,
+   433→      lastInDate: a.lastIn,
+   434→      lastOutDate: a.lastOut,
+   435→      lastMovementDate: lastMovement,
+   436→      daysSinceMovement: daysSince,
+   437→      hasInNoOut: a.inboundOps > 0 && a.outboundOps === 0,
+   438→      classification,
+   439→    });
+   440→  }
+   441→
+   442→  rows.sort((a, b) => (b.daysSinceMovement ?? 999999) - (a.daysSinceMovement ?? 999999));
+   443→  return rows;
+   444→}
+   445→
+   446→// ============================================================
+   447→// ۴) گزارش گردش کالا و ورود/خروج
+   448→// ============================================================
+   449→export interface MovementEntry {
+   450→  docId: string;
+   451→  docNumber: string;
+   452→  type: FlowOperation;
+   453→  dateJalali: string;
+   454→  dateEpoch: number;
+   455→  qtyIn: number;
+   456→  qtyOut: number;
+   457→  value: number;
+   458→}
+   459→
+   460→export interface MovementRow {
+   461→  variantId: string;
+   462→  productId: string;
+   463→  productName: string;
+   464→  variantSku: string;
+   465→  categoryName: string;
+   466→  storeId: string;
+   467→  storeName: string;
+   468→  warehouseId: string;
+   469→  warehouseName: string;
+   470→  status: StockStatus;
+   471→  opening: number;
+   472→  inQty: number;
+   473→  outQty: number;
+   474→  closing: number;
+   475→  // انتقال داخلی: از سمت ورود و خروج جدا نگه داشته می‌شود تا از جمع کل فقط یک‌بار کسر شود
+   476→  internalIn: number;
+   477→  internalOut: number;
+   478→  internalTransferQty: number;
+   479→  inValue: number;
+   480→  outValue: number;
+   481→  inByOp: Partial<Record<FlowOperation, number>>;
+   482→  outByOp: Partial<Record<FlowOperation, number>>;
+   483→  entries: MovementEntry[];
+   484→}
+   485→
+   486→export interface MovementFilters {
+   487→  fromEpoch: number;
+   488→  toEpoch: number;
+   489→  productId: string;
+   490→  variantId: string;
+   491→  categoryId: string;
+   492→  storeId: string;
+   493→  warehouseId: string;
+   494→  opTypes: FlowOperation[]; // خالی = همه
+   495→}
+   496→
+   497→export function movementReport(
+   498→  ds: ReportDataset,
+   499→  f: MovementFilters
+   500→): { rows: MovementRow[]; totals: { opening: number; inQty: number; outQty: number; closing: number; internal: number; inValue: number; outValue: number } } {
+   501→  const rows = new Map<string, MovementRow>();
+   502→  const passesBaseFilters = (variantId: string) => {
+   503→    const v = ds.variantById.get(variantId);
+   504→    if (!v) return false;
+   505→    if (f.productId !== 'all' && v.productId !== f.productId) return false;
+   506→    if (f.variantId !== 'all' && variantId !== f.variantId) return false;
+   507→    const p = ds.productById.get(v.productId);
+   508→    if (!p) return false;
+   509→    if (f.categoryId !== 'all' && p.categoryId !== f.categoryId) return false;
+   510→    return true;
+   511→  };
+   512→
+   513→  const passesWarehouseScope = (warehouseId: string) => {
+   514→    const w = ds.warehouseById.get(warehouseId);
+   515→    if (!w) return false;
+   516→    if (f.storeId !== 'all' && w.storeId !== f.storeId) return false;
+   517→    if (f.warehouseId !== 'all' && warehouseId !== f.warehouseId) return false;
+   518→    return true;
+   519→  };
+   520→
+   521→  const rowFor = (variantId: string, warehouseId: string, status: StockStatus): MovementRow | null => {
+   522→    if (!passesBaseFilters(variantId)) return null;
+   523→    if (!passesWarehouseScope(warehouseId)) return null;
+   524→    if (status === 'in-transit') return null;
+   525→    const key = `${variantId}|${warehouseId}|${status}`;
+   526→    if (rows.has(key)) return rows.get(key)!;
+   527→    const v = ds.variantById.get(variantId)!;
+   528→    const p = ds.productById.get(v.productId)!;
+   529→    const w = ds.warehouseById.get(warehouseId)!;
+   530→    const row: MovementRow = {
+   531→      variantId,
+   532→      productId: v.productId,
+   533→      productName: p.name,
+   534→      variantSku: v.sku,
+   535→      categoryName: ds.categoryById.get(p.categoryId)?.name ?? '—',
+   536→      storeId: w.storeId,
+   537→      storeName: ds.storeById.get(w.storeId)?.name ?? '—',
+   538→      warehouseId,
+   539→      warehouseName: w.name,
+   540→      status,
+   541→      opening: 0,
+   542→      inQty: 0,
+   543→      outQty: 0,
+   544→      closing: 0,
+   545→      internalIn: 0,
+   546→      internalOut: 0,
+   547→      internalTransferQty: 0,
+   548→      inValue: 0,
+   549→      outValue: 0,
+   550→      inByOp: {},
+   551→      outByOp: {},
+   552→      entries: [],
+   553→    };
+   554→    rows.set(key, row);
+   555→    return row;
+   556→  };
+   557→
+   558→  // موجودی پایان دوره از داده واقعی موجودی
+   559→  for (const inv of ds.inventory) {
+   560→    if (inv.status === 'in-transit') continue;
+   561→    const row = rowFor(inv.variantId, inv.warehouseId, inv.status);
+   562→    if (row) row.closing += inv.quantity;
+   563→  }
+   564→
+   565→  // آیا انتقال در این scope داخلی محسوب می‌شود؟
+   566→  const transferIsInternal = (doc: Document): boolean => {
+   567→    if (f.warehouseId !== 'all') return false; // در scope انبار، انتقال واقعی است
+   568→    if (f.storeId === 'all') return true; // scope کل شرکت
+   569→    const src = ds.warehouseById.get(doc.sourceWarehouseId ?? '');
+   570→    const dst = ds.warehouseById.get(doc.destinationWarehouseId ?? '');
+   571→    return !!src && !!dst && src.storeId === f.storeId && dst.storeId === f.storeId;
+   572→  };
+   573→
+   574→  const allowedTypes = (t: FlowOperation) => f.opTypes.length === 0 || f.opTypes.includes(t);
+   575→
+   576→  const confirmed = ds.docs
+   577→    .filter((d) => d.status === 'confirmed')
+   578→    .filter((d) => d.dateEpoch >= f.fromEpoch && d.dateEpoch <= f.toEpoch)
+   579→    .filter((d) => allowedTypes(d.type))
+   580→    .sort((a, b) => a.dateEpoch - b.dateEpoch);
+   581→
+   582→  for (const d of confirmed) {
+   583→    const lines = ds.linesByDoc.get(d.id) ?? [];
+   584→    for (const l of lines) {
+   585→      const value = l.quantity * lineEffectiveCost(l);
+   586→      if (d.type === 'receipt') {
+   587→        const row = rowFor(l.variantId, d.destinationWarehouseId ?? '', 'healthy');
+   588→        if (row) {
+   589→          row.inQty += l.quantity;
+   590→          row.inValue += value;
+   591→          row.inByOp.receipt = (row.inByOp.receipt ?? 0) + l.quantity;
+   592→          row.entries.push({ docId: d.id, docNumber: d.number, type: d.type, dateJalali: d.dateJalali, dateEpoch: d.dateEpoch, qtyIn: l.quantity, qtyOut: 0, value });
+   593→        }
+   594→      } else if (d.type === 'issue') {
+   595→        const row = rowFor(l.variantId, d.sourceWarehouseId ?? '', l.stockStatus || 'healthy');
+   596→        if (row) {
+   597→          row.outQty += l.quantity;
+   598→          row.outValue += value;
+   599→          row.outByOp.issue = (row.outByOp.issue ?? 0) + l.quantity;
+   600→          row.entries.push({ docId: d.id, docNumber: d.number, type: d.type, dateJalali: d.dateJalali, dateEpoch: d.dateEpoch, qtyIn: 0, qtyOut: l.quantity, value });
+   601→        }
+   602→      } else if (d.type === 'return') {
+   603→        const row = rowFor(l.variantId, d.destinationWarehouseId ?? '', l.stockStatus || 'healthy');
+   604→        if (row) {
+   605→          row.inQty += l.quantity;
+   606→          row.inValue += value;
+   607→          row.inByOp.return = (row.inByOp.return ?? 0) + l.quantity;
+   608→          row.entries.push({ docId: d.id, docNumber: d.number, type: d.type, dateJalali: d.dateJalali, dateEpoch: d.dateEpoch, qtyIn: l.quantity, qtyOut: 0, value });
+   609→        }
+   610→      } else if (d.type === 'adjustment') {
+   611→        const dir = d.adjustmentDirection ?? 'increase';
+   612→        const row = rowFor(l.variantId, d.sourceWarehouseId ?? '', l.stockStatus || 'healthy');
+   613→        if (row) {
+   614→          if (dir === 'increase') {
+   615→            row.inQty += l.quantity;
+   616→            row.inValue += value;
+   617→            row.inByOp.adjustment = (row.inByOp.adjustment ?? 0) + l.quantity;
+   618→            row.entries.push({ docId: d.id, docNumber: d.number, type: d.type, dateJalali: d.dateJalali, dateEpoch: d.dateEpoch, qtyIn: l.quantity, qtyOut: 0, value });
+   619→          } else {
+   620→            row.outQty += l.quantity;
+   621→            row.outValue += value;
+   622→            row.outByOp.adjustment = (row.outByOp.adjustment ?? 0) + l.quantity;
+   623→            row.entries.push({ docId: d.id, docNumber: d.number, type: d.type, dateJalali: d.dateJalali, dateEpoch: d.dateEpoch, qtyIn: 0, qtyOut: l.quantity, value });
+   624→          }
+   625→        }
+   626→      } else if (d.type === 'transfer') {
+   627→        const internal = transferIsInternal(d);
+   628→        const srcRow = rowFor(l.variantId, d.sourceWarehouseId ?? '', 'healthy');
+   629→        if (srcRow) {
+   630→          srcRow.outQty += l.quantity;
+   631→          srcRow.outValue += value;
+   632→          srcRow.outByOp.transfer = (srcRow.outByOp.transfer ?? 0) + l.quantity;
+   633→          if (internal) {
+   634→            srcRow.internalOut += l.quantity;
+   635→            srcRow.internalTransferQty += l.quantity;
+   636→          }
+   637→          srcRow.entries.push({ docId: d.id, docNumber: d.number, type: d.type, dateJalali: d.dateJalali, dateEpoch: d.dateEpoch, qtyIn: 0, qtyOut: l.quantity, value });
+   638→        }
+   639→        const dstRow = rowFor(l.variantId, d.destinationWarehouseId ?? '', 'healthy');
+   640→        if (dstRow) {
+   641→          dstRow.inQty += l.quantity;
+   642→          dstRow.inValue += value;
+   643→          dstRow.inByOp.transfer = (dstRow.inByOp.transfer ?? 0) + l.quantity;
+   644→          if (internal) {
+   645→            dstRow.internalIn += l.quantity;
+   646→            dstRow.internalTransferQty += l.quantity;
+   647→          }
+   648→          dstRow.entries.push({ docId: d.id, docNumber: d.number, type: d.type, dateJalali: d.dateJalali, dateEpoch: d.dateEpoch, qtyIn: l.quantity, qtyOut: 0, value });
+   649→        }
+   650→      }
+   651→    }
+   652→  }
+   653→
+   654→  // موجودی اول دوره = پایان دوره − خالص گردش بازه
+   655→  const result = [...rows.values()];
+   656→  for (const r of result) {
+   657→    r.opening = r.closing - (r.inQty - r.outQty);
+   658→  }
+   659→
+   660→  // جمع کل — انتقال داخلی از ورود/خروج واقعی تفکیک می‌شود
+   661→  const totals = result.reduce(
+   662→    (acc, r) => {
+   663→      acc.opening += r.opening;
+   664→      acc.closing += r.closing;
+   665→      acc.inQty += r.inQty - r.internalIn;
+   666→      acc.outQty += r.outQty - r.internalOut;
+   667→      acc.internal += r.internalIn + r.internalOut;
+   668→      acc.inValue += r.inValue;
+   669→      acc.outValue += r.outValue;
+   670→      return acc;
+   671→    },
+   672→    { opening: 0, inQty: 0, outQty: 0, closing: 0, internal: 0, inValue: 0, outValue: 0 }
+   673→  );
+   674→
+   675→  result.sort(
+   676→    (a, b) =>
+   677→      a.productName.localeCompare(b.productName, 'fa') ||
+   678→      a.warehouseName.localeCompare(b.warehouseName, 'fa')
+   679→  );
+   680→
+   681→  return { rows: result, totals };
+   682→}
+   683→
+   684→// جمع ورود/خروج یک بازه دلخواه (برای مقایسه بازه‌ها) — در سطح scope فعلی
+   685→export function movementTotals(
+   686→  ds: ReportDataset,
+   687→  fromEpoch: number,
+   688→  toEpoch: number,
+   689→  base: MovementFilters
+   690→): { inQty: number; outQty: number; inValue: number; outValue: number } {
+   691→  const { rows, totals } = movementReport(ds, { ...base, fromEpoch, toEpoch });
+   692→  void rows;
+   693→  return {
+   694→    inQty: totals.inQty,
+   695→    outQty: totals.outQty,
+   696→    inValue: totals.inValue,
+   697→    outValue: totals.outValue,
+   698→  };
+   699→}
+   700→
+   701→// ============================================================
+   702→// ۵) گزارش ارزش موجودی و بهای خرید
+   703→// ============================================================
+   704→export interface ValueRow {
+   705→  variantId: string;
+   706→  productName: string;
+   707→  variantSku: string;
+   708→  categoryName: string;
+   709→  unitName: string;
+   710→  healthyQty: number;
+   711→  healthyValue: number;
+   712→  defectiveQty: number;
+   713→  defectiveValue: number;
+   714→  inTransitQty: number;
+   715→  inTransitValue: number;
+   716→  totalValue: number;
+   717→  avgCost: number;
+   718→  lastPurchasePrice: number | null;
+   719→  lastPurchaseDateJalali: string | null;
+   720→  sharePercent: number;
+   721→}
+   722→
+   723→export interface ValueFilters {
+   724→  productId: string;
+   725→  categoryId: string;
+   726→  storeId: string;
+   727→  warehouseId: string;
+   728→}
+   729→
+   730→export function valueReport(
+   731→  ds: ReportDataset,
+   732→  f: ValueFilters
+   733→): {
+   734→  rows: ValueRow[];
+   735→  storeGroups: { name: string; value: number }[];
+   736→  warehouseGroups: { name: string; value: number }[];
+   737→  totals: { healthy: number; defective: number; inTransit: number; total: number };
+   738→} {
+   739→  const variantAgg = new Map<
+   740→    string,
+   741→    { healthyQty: number; healthyValue: number; defectiveQty: number; defectiveValue: number; inTransitQty: number; inTransitValue: number }
+   742→  >();
+   743→  const storeGroups = new Map<string, number>();
+   744→  const warehouseGroups = new Map<string, number>();
+   745→
+   746→  const passesScope = (warehouseId: string) => {
+   747→    const w = ds.warehouseById.get(warehouseId);
+   748→    if (!w) return false;
+   749→    if (f.storeId !== 'all' && w.storeId !== f.storeId) return false;
+   750→    if (f.warehouseId !== 'all' && warehouseId !== f.warehouseId) return false;
+   751→    return true;
+   752→  };
+   753→
+   754→  for (const inv of ds.inventory) {
+   755→    if (!passesScope(inv.warehouseId)) continue;
+   756→    const v = ds.variantById.get(inv.variantId);
+   757→    if (!v) continue;
+   758→    const p = ds.productById.get(v.productId);
+   759→    if (!p) continue;
+   760→    if (f.productId !== 'all' && v.productId !== f.productId) continue;
+   761→    if (f.categoryId !== 'all' && p.categoryId !== f.categoryId) continue;
+   762→
+   763→    const value = inv.quantity * inv.averageCost;
+   764→    let a = variantAgg.get(inv.variantId);
+   765→    if (!a) {
+   766→      a = { healthyQty: 0, healthyValue: 0, defectiveQty: 0, defectiveValue: 0, inTransitQty: 0, inTransitValue: 0 };
+   767→      variantAgg.set(inv.variantId, a);
+   768→    }
+   769→    if (inv.status === 'healthy') {
+   770→      a.healthyQty += inv.quantity;
+   771→      a.healthyValue += value;
+   772→    } else if (inv.status === 'defective') {
+   773→      a.defectiveQty += inv.quantity;
+   774→      a.defectiveValue += value;
+   775→    } else {
+   776→      a.inTransitQty += inv.quantity;
+   777→      a.inTransitValue += value;
+   778→    }
+   779→
+   780→    const w = ds.warehouseById.get(inv.warehouseId)!;
+   781→    warehouseGroups.set(w.name, (warehouseGroups.get(w.name) ?? 0) + value);
+   782→    const storeName = ds.storeById.get(w.storeId)?.name ?? '—';
+   783→    storeGroups.set(storeName, (storeGroups.get(storeName) ?? 0) + value);
+   784→  }
+   785→
+   786→  // آخرین قیمت خرید ثبت‌شده (رسید تأییدشده با جدیدترین تاریخ)
+   787→  const lastPurchase = new Map<string, { price: number; dateJalali: string; epoch: number }>();
+   788→  const receiptDocs = ds.docs
+   789→    .filter((d) => d.type === 'receipt' && d.status === 'confirmed')
+   790→    .sort((a, b) => a.dateEpoch - b.dateEpoch);
+   791→  for (const d of receiptDocs) {
+   792→    const lines = ds.linesByDoc.get(d.id) ?? [];
+   793→    for (const l of lines) {
+   794→      const cur = lastPurchase.get(l.variantId);
+   795→      if (!cur || d.dateEpoch >= cur.epoch) {
+   796→        lastPurchase.set(l.variantId, { price: lineEffectiveCost(l), dateJalali: d.dateJalali, epoch: d.dateEpoch });
+   797→      }
+   798→    }
+   799→  }
+   800→
+   801→  const grandTotal = [...variantAgg.values()].reduce((s, a) => s + a.healthyValue + a.defectiveValue + a.inTransitValue, 0);
+   802→
+   803→  const rows: ValueRow[] = [];
+   804→  for (const [variantId, a] of variantAgg) {
+   805→    const v = ds.variantById.get(variantId)!;
+   806→    const p = ds.productById.get(v.productId)!;
+   807→    const totalValue = a.healthyValue + a.defectiveValue + a.inTransitValue;
+   808→    const totalQty = a.healthyQty + a.defectiveQty + a.inTransitQty;
+   809→    const lp = lastPurchase.get(variantId);
+   810→    const unit = ds.unitById.get(p.mainUnitId);
+   811→    rows.push({
+   812→      variantId,
+   813→      productName: p.name,
+   814→      variantSku: v.sku,
+   815→      categoryName: ds.categoryById.get(p.categoryId)?.name ?? '—',
+   816→      unitName: unit?.name ?? '',
+   817→      healthyQty: a.healthyQty,
+   818→      healthyValue: a.healthyValue,
+   819→      defectiveQty: a.defectiveQty,
+   820→      defectiveValue: a.defectiveValue,
+   821→      inTransitQty: a.inTransitQty,
+   822→      inTransitValue: a.inTransitValue,
+   823→      totalValue,
+   824→      avgCost: totalQty > 0 ? totalValue / totalQty : 0,
+   825→      lastPurchasePrice: lp?.price ?? null,
+   826→      lastPurchaseDateJalali: lp?.dateJalali ?? null,
+   827→      sharePercent: grandTotal > 0 ? (totalValue / grandTotal) * 100 : 0,
+   828→    });
+   829→  }
+   830→
+   831→  rows.sort((a, b) => b.totalValue - a.totalValue);
+   832→
+   833→  const totals = {
+   834→    healthy: [...variantAgg.values()].reduce((s, a) => s + a.healthyValue, 0),
+   835→    defective: [...variantAgg.values()].reduce((s, a) => s + a.defectiveValue, 0),
+   836→    inTransit: [...variantAgg.values()].reduce((s, a) => s + a.inTransitValue, 0),
+   837→    total: grandTotal,
+   838→  };
+   839→
+   840→  return {
+   841→    rows,
+   842→    storeGroups: [...storeGroups.entries()].map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value),
+   843→    warehouseGroups: [...warehouseGroups.entries()].map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value),
+   844→    totals,
+   845→  };
+   846→}
+   847→
